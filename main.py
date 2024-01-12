@@ -1,41 +1,86 @@
-from flask_ngrok import run_with_ngrok
-from flask import Flask, render_template, request
-
+import os
 import torch
-from diffusers import StableDiffusionPipeline
+import logging
+from flask import Flask, render_template, request, redirect, url_for, send_from_directory
+from werkzeug.utils import secure_filename
 
-import base64
-from io import BytesIO
+from PIL import Image
+from diffusers import StableDiffusionImg2ImgPipeline
+from diffusers.utils import export_to_video
 
-# Load model
-pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", revision="fp16", torch_dtype=torch.float16)
-pipe.to("cuda")
-
-# Start flask app and set to ngrok
 app = Flask(__name__)
-run_with_ngrok(app)
 
-@app.route('/')
-def initial():
-  return render_template('index.html')
+# Configure the upload folder and allowed extensions
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'jpg', 'jpeg', 'png'}
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
+# Function to check if the file has an allowed extension
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-@app.route('/submit-prompt', methods=['POST'])
-def generate_image():
-  prompt = request.form['prompt-input']
-  print(f"Generating an image of {prompt}")
+# Function to generate video using GPU
+def generate_video_with_gpu(text_input, image_path):
+    # Load the image
+    p = Image.open(image_path)
+    init_image = p.convert("RGB")
 
-  image = pipe(prompt).images[0]
-  print("Image generated! Converting image ...")
-  
-  buffered = BytesIO()
-  image.save(buffered, format="PNG")
-  img_str = base64.b64encode(buffered.getvalue())
-  img_str = "data:image/png;base64," + str(img_str)[2:-1]
+    # Initialize the AI model with CUDA support
+    pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
+        "CompVis/stable-diffusion-v1-4",
+        variant="fp16",
+        torch_dtype=torch.float16,
+    ).to("cuda")
 
-  print("Sending image ...")
-  return render_template('index.html', generated_image=img_str)
+    pipe.enable_attention_slicing()
 
+    # Generate video using CUDA
+    torch.manual_seed(767)
+    gen_images = pipe(prompt=text_input, num_images_per_prompt=1, image=init_image, strength=0.8, num_inference_steps=80, guidance_scale=15)
+
+    # Save the generated video
+    video_path = os.path.join(app.config['UPLOAD_FOLDER'], 'generated.mp4')
+    export_to_video(gen_images.frames[0], video_path, fps=7)
+
+    return video_path
+
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    if request.method == 'POST':
+        # Check if a text input and an image file were provided
+        if 'text_input' not in request.form or 'image' not in request.files:
+            return render_template('index.html', error='Please provide both text and an image.')
+
+        text_input = request.form['text_input']
+        image_file = request.files['image']
+
+        # Check if the text input is empty
+        if not text_input:
+            return render_template('index.html', error='Text input cannot be empty.')
+
+        # Check if an image file was provided and has an allowed extension
+        if image_file.filename == '':
+            return render_template('index.html', error='No selected image file.')
+
+        if not allowed_file(image_file.filename):
+            return render_template('index.html', error='Invalid file format. Allowed formats: jpg, jpeg, png.')
+
+        # Securely save the image file
+        filename = secure_filename(image_file.filename)
+        image_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        image_file.save(image_path)
+
+        try:
+            # Generate the video using GPU
+            video_path = generate_video_with_gpu(text_input, image_path)
+            
+            # Return the video filename or link to the frontend
+            return render_template('index.html', success='Video generated successfully. Download the video below.', video_path=video_path)
+        except Exception as e:
+            # Handle any exceptions during processing
+            return render_template('index.html', error=f'Error processing the request: {str(e)}')
+
+    return render_template('index.html')
 
 if __name__ == '__main__':
-    app.run()
+    app.run(debug=True)
